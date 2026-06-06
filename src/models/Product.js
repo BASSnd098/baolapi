@@ -20,7 +20,7 @@ const productSchema = new mongoose.Schema({
   category: {
     type: String,
     required: [true, 'La catégorie est requise'],
-    enum: ['electronics', 'clothing', 'books', 'home', 'beauty', 'sports', 'autres']
+    enum: ['Ordinateurs', 'IoT', 'Réseaux', 'Sécurité', 'Stockage', 'Logiciels']
   },
   images: [{
     url: String,

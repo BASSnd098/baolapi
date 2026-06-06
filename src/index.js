@@ -4,139 +4,198 @@ const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const sanitize = require('mongo-sanitize');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
+// Chargement des variables d'environnement
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-// Connexion MongoDB
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ MongoDB connecté'))
-  .catch(err => console.error('❌ MongoDB error:', err));
+// ==================== CONFIGURATION SÉCURITÉ EXPRESS ====================
 
-// Schéma User
-const userSchema = new mongoose.Schema({
-  name: String,
-  email: { type: String, unique: true },
-  password: String,
-  role: { type: String, default: 'user' }
+// 1. Protection des en-têtes HTTP (Masque Express, empêche le clickjacking, etc.)
+app.use(helmet()); 
+
+// 2. Configuration CORS
+app.use(cors({
+  origin: process.env.CLIENT_URL || '*', // En prod, remplacez '*' par l'URL de votre frontend (Vercel, etc.)
+  optionsSuccessStatus: 200
+}));
+
+// 3. Limite la taille des requêtes entrantes (Évite la saturation de la mémoire / DoS)
+app.use(express.json({ limit: '10kb' })); 
+
+// 4. Limiteur de requêtes pour bloquer le Brute-Force sur l'authentification
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // Fenêtre de 15 minutes
+  max: 20, // Limite chaque IP à 20 requêtes par fenêtre
+  message: { success: false, message: "Trop de tentatives. Veuillez réessayer dans 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
+
+// ==================== CONNEXION BASE DE DONNÉES ====================
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ MongoDB connecté avec succès'))
+  .catch(err => console.error('❌ Erreur de connexion MongoDB:', err));
+
+// ==================== MODÈLES MONGOOSE ====================
+
+// Schéma Utilisateur
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password: { type: String, required: true },
+  role: { type: String, enum: ['user', 'admin'], default: 'user' },
+  createdAt: { type: Date, default: Date.now }
+});
+
+// Hachage automatique du mot de passe avant sauvegarde (Sel élevé à 12 pour la prod)
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 12);
+  next();
+});
+
+// Méthode de comparaison sécurisée
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return await bcrypt.compare(candidatePassword, this.password);
+};
 
 const User = mongoose.model('User', userSchema);
 
-// Schéma Product
+// Schéma Produit
 const productSchema = new mongoose.Schema({
-  name: String,
-  price: Number,
-  description: String,
-  category: String,
-  stock: { type: Number, default: 0 },
-  featured: { type: Boolean, default: false }
+  name: { type: String, required: true, trim: true },
+  price: { type: Number, required: true, min: 0 },
+  description: { type: String, required: true },
+  category: { type: String, required: true },
+  images: [{ url: String, public_id: String }],
+  stock: { type: Number, default: 0, min: 0 },
+  featured: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
 });
 
 const Product = mongoose.model('Product', productSchema);
 
-// ==================== ROUTES ====================
+// ==================== MIDDLEWARES & SÉCURITÉ AUTH ====================
 
-// Health check
+// Génération du JWT (Réduit à 1 jour pour limiter l'impact en cas de vol de token)
+const generateToken = (id, role) => {
+  return jwt.sign({ id, role }, process.env.JWT_SECRET, { expiresIn: '1d' });
+};
+
+// Vérification du Token
+const verifyToken = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Accès refusé. Token manquant.' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id).select('-password');
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: 'Utilisateur introuvable.' });
+    }
+    next();
+  } catch (error) {
+    res.status(401).json({ success: false, message: 'Token invalide ou expiré.' });
+  }
+};
+
+// Vérification du rôle Admin
+const isAdmin = (req, res, next) => {
+  if (req.user && req.user.role === 'admin') {
+    next();
+  } else {
+    res.status(403).json({ success: false, message: 'Accès interdit. Rôle Admin requis.' });
+  }
+};
+
+// ==================== ROUTES PUBLIQUES ====================
+
+// Health Check pour Render
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK' });
+  res.json({ status: 'OK', message: 'L\'API fonctionne parfaitement.' });
 });
 
-// Setup admin - Version qui force la création
+// Initialisation sécurisée du premier administrateur via clé secrète
 app.post('/api/admin/setup', async (req, res) => {
   try {
-    // Supprimer l'admin existant s'il y en a un
-    await User.deleteMany({ role: 'admin' });
-    console.log('Deleted existing admin');
+    // Exige la présence d'une clé secrète dans les en-têtes HTTP pour s'exécuter
+    if (!process.env.SETUP_KEY || req.headers['x-setup-key'] !== process.env.SETUP_KEY) {
+      return res.status(403).json({ success: false, message: 'Action non autorisée.' });
+    }
+
+    const adminExists = await User.findOne({ role: 'admin' });
+    if (adminExists) {
+      return res.status(400).json({ success: false, message: 'Le compte Administrateur existe déjà.' });
+    }
     
-    // Créer le nouveau admin
-    const hashedPassword = await bcrypt.hash('Admin123456', 10);
-    const admin = await User.create({
+    await User.create({
       name: 'Administrateur',
       email: 'admin@baoltech.com',
-      password: hashedPassword,
+      password: process.env.ADMIN_DEFAULT_PASSWORD || 'Admin123456!',
       role: 'admin'
     });
     
-    console.log('New admin created:', admin.email);
-    
-    res.json({
-      success: true,
-      message: 'Admin créé avec succès',
-      credentials: {
-        email: 'admin@baoltech.com',
-        password: 'Admin123456'
-      }
-    });
+    res.json({ success: true, message: 'Compte Administrateur initial créé avec succès.' });
   } catch (error) {
-    console.error('Setup error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: 'Erreur lors de la configuration.' });
   }
 });
 
-// Register
-app.post('/api/auth/register', async (req, res) => {
+// Inscription (Protégée contre le spam et les injections NoSQL)
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-    
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ success: false, message: 'Email déjà utilisé' });
+    const email = sanitize(req.body.email);
+    const { name, password } = req.body;
+
+    if (!email || !password || !name) {
+      return res.status(400).json({ success: false, message: 'Tous les champs sont requis.' });
     }
     
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const user = await User.create({
-      name,
-      email,
-      password: hashedPassword
-    });
+    const userExists = await User.findOne({ email });
+    if (userExists) {
+      return res.status(400).json({ success: false, message: 'Cet email est déjà utilisé.' });
+    }
     
-    const token = jwt.sign(
-      { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
+    const user = await User.create({ name, email, password });
+    const token = generateToken(user._id, user.role);
     
-    res.json({
+    res.status(201).json({
       success: true,
       token,
       user: { id: user._id, name: user.name, email: user.email, role: user.role }
     });
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: 'Erreur lors de la création du compte.' });
   }
 });
 
-// Login
-app.post('/api/auth/login', async (req, res) => {
+// Connexion sécurisée (Contre l'énumération de comptes et les injections NoSQL)
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    
-    console.log('Login attempt:', email);
-    
+    const email = sanitize(req.body.email);
+    const { password } = req.body;
+
     const user = await User.findOne({ email });
-    if (!user) {
-      console.log('User not found');
-      return res.status(401).json({ success: false, message: 'Email ou mot de passe incorrect' });
+    
+    // Protection contre les Timing Attacks : Si l'utilisateur n'existe pas, 
+    // on compare le mot de passe reçu avec un faux hash pour consommer du temps CPU équivalent.
+    const fakeHash = "$2a$12$LRYuclvR780An72Q79DwXur6bd.vWf2mS89M.P6At.R7w7hYscvG.";
+    const isMatch = user ? await user.comparePassword(password) : await bcrypt.compare(password, fakeHash);
+
+    if (!user || !isMatch) {
+      // Message d'erreur volontairement flou pour des raisons de sécurité
+      return res.status(401).json({ success: false, message: 'Identifiants invalides.' });
     }
     
-    console.log('User found, checking password...');
-    const isValid = await bcrypt.compare(password, user.password);
-    console.log('Password valid:', isValid);
-    
-    if (!isValid) {
-      return res.status(401).json({ success: false, message: 'Email ou mot de passe incorrect' });
-    }
-    
-    const token = jwt.sign(
-      { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
+    const token = generateToken(user._id, user.role);
     
     res.json({
       success: true,
@@ -144,46 +203,122 @@ app.post('/api/auth/login', async (req, res) => {
       user: { id: user._id, name: user.name, email: user.email, role: user.role }
     });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: 'Erreur lors de la connexion.' });
   }
 });
 
-// Get products
+// Obtenir le profil de l'utilisateur connecté
+app.get('/api/auth/me', verifyToken, async (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+// ==================== ROUTES PRODUITS (PUBLIQUES) ====================
+
+// Récupérer tous les produits
 app.get('/api/products', async (req, res) => {
   try {
-    const products = await Product.find();
+    const products = await Product.find().sort({ createdAt: -1 }).lean();
     res.json({ success: true, products });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: 'Erreur lors de la récupération des produits.' });
   }
 });
 
-// Create product (admin only)
-app.post('/api/admin/products', async (req, res) => {
+// Récupérer un produit par son ID
+app.get('/api/products/:id', async (req, res) => {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ success: false, message: 'Token manquant' });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Format de l\'identifiant invalide.' });
     }
-    
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
-    
-    if (!user || user.role !== 'admin') {
-      return res.status(403).json({ success: false, message: 'Admin requis' });
+    const product = await Product.findById(req.params.id).lean();
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Produit introuvable.' });
     }
-    
+    res.json({ success: true, product });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  }
+});
+
+// ==================== ROUTES EN ESPACE ADMIN (PROTÉGÉES) ====================
+
+// Ajouter un produit
+app.post('/api/admin/products', verifyToken, isAdmin, async (req, res) => {
+  try {
     const product = await Product.create(req.body);
     res.status(201).json({ success: true, product });
   } catch (error) {
-    console.error('Create product error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    res.status(400).json({ success: false, message: 'Impossible de créer le produit. Données invalides.' });
   }
 });
 
-// ==================== DÉMARRAGE ====================
+// Modifier un produit
+app.put('/api/admin/products/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Format de l\'identifiant invalide.' });
+    }
+    const product = await Product.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { returnDocument: 'after', runValidators: true }
+    );
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Produit introuvable.' });
+    }
+    res.json({ success: true, product });
+  } catch (error) {
+    res.status(400).json({ success: false, message: 'Erreur lors de la mise à jour.' });
+  }
+});
+
+// Supprimer un produit
+app.delete('/api/admin/products/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Format de l\'identifiant invalide.' });
+    }
+    const product = await Product.findByIdAndDelete(req.params.id);
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Produit introuvable.' });
+    }
+    res.json({ success: true, message: 'Le produit a été supprimé avec succès.' });
+  } catch (error) {
+    res.status(400).json({ success: false, message: 'Erreur lors de la suppression.' });
+  }
+});
+
+// Lister tous les utilisateurs (Réservé à l'admin)
+app.get('/api/admin/users', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const users = await User.find().select('-password').lean();
+    res.json({ success: true, users });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Erreur lors de la récupération des utilisateurs.' });
+  }
+});
+
+// ==================== TRAITEMENT DES ERREURS & FALLBACKS ====================
+
+// Gestion des routes inexistantes (404)
+app.use((req, res) => {
+  res.status(404).json({ success: false, message: 'La ressource demandée n\'existe pas.' });
+});
+
+// Intercepteur global d'erreurs (Empêche la fuite des messages système en production)
+app.use((err, req, res, next) => {
+  console.error(' [Erreur Système] :', err.message);
+  res.status(500).json({ 
+    success: false, 
+    message: 'Une erreur interne est survenue sur le serveur.' 
+  });
+});
+
+// ==================== SÉLECTION ET ÉCOUTE DU PORT ====================
+
+// Affectation dynamique : Utile pour Render (qui écoute sur 0.0.0.0 via le port fourni ou par défaut 10000)
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`✅ Serveur sur http://localhost:${PORT}`);
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n✅ Le serveur écoute sur le port : ${PORT}`);
 });
