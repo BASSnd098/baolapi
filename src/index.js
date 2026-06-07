@@ -20,22 +20,25 @@ app.use(helmet());
 
 // 2. Configuration CORS (Gestion multi-origines pour le local et la production)
 const allowedOrigins = [
-  'http://localhost:5173', // Port par défaut de Vite en local
-  'http://localhost:3000',
-  'https://baoltechnologie.com',
-  'https://www.baoltechnologie.com'
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "https://baoltechnologie.com",
+  "https://www.baoltechnologie.com"
 ];
 
 app.use(cors({
-  origin: function (origin, callback) {
-    // Permet aux requêtes sans origine (comme Postman ou applications mobiles) ou aux origines de la liste de passer
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Bloqué par la politique CORS de Baol Technologies'));
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+
+    return callback(new Error(`Origin non autorisée: ${origin}`));
   },
-  optionsSuccessStatus: 200
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 // 3. Limite la taille des requêtes entrantes (Évite la saturation de la mémoire / DoS)
