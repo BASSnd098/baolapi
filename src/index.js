@@ -18,9 +18,23 @@ const app = express();
 // 1. Protection des en-têtes HTTP (Masque Express, empêche le clickjacking, etc.)
 app.use(helmet()); 
 
-// 2. Configuration CORS
+// 2. Configuration CORS (Gestion multi-origines pour le local et la production)
+const allowedOrigins = [
+  'http://localhost:5173', // Port par défaut de Vite en local
+  'http://localhost:3000',
+  'https://baoltechnologie.com',
+  'https://www.baoltechnologie.com'
+];
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || '*', // En prod, remplacez '*' par l'URL de votre frontend (Vercel, etc.)
+  origin: function (origin, callback) {
+    // Permet aux requêtes sans origine (comme Postman ou applications mobiles) ou aux origines de la liste de passer
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Bloqué par la politique CORS de Baol Technologies'));
+    }
+  },
   optionsSuccessStatus: 200
 }));
 
@@ -185,13 +199,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     const user = await User.findOne({ email });
     
-    // Protection contre les Timing Attacks : Si l'utilisateur n'existe pas, 
-    // on compare le mot de passe reçu avec un faux hash pour consommer du temps CPU équivalent.
+    // Protection contre les Timing Attacks
     const fakeHash = "$2a$12$LRYuclvR780An72Q79DwXur6bd.vWf2mS89M.P6At.R7w7hYscvG.";
     const isMatch = user ? await user.comparePassword(password) : await bcrypt.compare(password, fakeHash);
 
     if (!user || !isMatch) {
-      // Message d'erreur volontairement flou pour des raisons de sécurité
       return res.status(401).json({ success: false, message: 'Identifiants invalides.' });
     }
     
@@ -305,7 +317,7 @@ app.use((req, res) => {
   res.status(404).json({ success: false, message: 'La ressource demandée n\'existe pas.' });
 });
 
-// Intercepteur global d'erreurs (Empêche la fuite des messages système en production)
+// Intercepteur global d'erreurs
 app.use((err, req, res, next) => {
   console.error(' [Erreur Système] :', err.message);
   res.status(500).json({ 
@@ -316,7 +328,6 @@ app.use((err, req, res, next) => {
 
 // ==================== SÉLECTION ET ÉCOUTE DU PORT ====================
 
-// Affectation dynamique : Utile pour Render (qui écoute sur 0.0.0.0 via le port fourni ou par défaut 10000)
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, '0.0.0.0', () => {
